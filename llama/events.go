@@ -18,6 +18,12 @@ type Event struct {
 	// events generally, when meaningful).
 	Block *ContentBlock
 
+	// ToolCall is set on toolcall_start (ID and Name are known, args
+	// still empty) and toolcall_end (fully populated). It carries the
+	// deduplicated ID, so gateway-style consumers can emit the id
+	// before any argument fragments arrive.
+	ToolCall *ToolCall
+
 	// Reason is set on done and error events.
 	Reason StopReason
 

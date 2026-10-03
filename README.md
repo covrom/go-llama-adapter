@@ -6,6 +6,11 @@ It speaks the OpenAI-compatible chat completions API that the llama.cpp server e
 
 **Scope: llama.cpp only.** No provider registry, no OAuth, no multi-API dispatch, no external dependencies (standard library only). If you need other backends, that is a different project.
 
+The repo contains two things:
+
+- `llama/` — the adapter library: client, SSE parser, event protocol.
+- `cmd/llama-gateway/` — a standalone OpenAI-compatible HTTP gateway built on the library. This is the integration point for harnesses (such as DeepSeek Harness) that only speak the OpenAI chat-completions protocol. See [Connecting to DeepSeek Harness (DSH)](#connecting-to-deepseek-harness-dsh).
+
 ## Why this exists
 
 LLM harnesses that stream tool calls from OpenAI-compatible servers have to handle provider quirks carefully. This adapter bakes the lessons learned from a real corruption incident in one place:
@@ -77,6 +82,66 @@ func main() {
 
 Or consume the whole stream at once with `msg, err := stream.Wait()`.
 
+## Connecting to DeepSeek Harness (DSH)
+
+DSH's LLM layer (`@deepseek-ai/dsh-llm`) is a TypeScript plugin system: a provider-neutral LLM service with adapter plugins mounted into the composition. The adapter DSH ships, `@deepseek-ai/dsh-llm-pi-ai`, sits on top of `@earendil-works/pi-ai` and talks whatever wire protocol its route declares. A Go library **cannot be mounted as a DSH plugin directly** — the plugin seam is Node/TS only — so the supported topology is to run the included OpenAI-compatible gateway between DSH and llama.cpp:
+
+```text
+llama.cpp server  ←(OpenAI SSE)←  llama-gateway (this repo)  ←(OpenAI SSE)←  DSH provider route (api: openai-completions)
+```
+
+### 1. Start llama.cpp
+
+```sh
+./llama-server -m /models/qwen3.gguf --port 8080
+```
+
+### 2. Run the gateway in front of it
+
+```sh
+go build -o llama-gateway ./cmd/llama-gateway
+LLAMA_GW_UPSTREAM=http://127.0.0.1:8080 \
+LLAMA_GW_MODEL=qwen3 \
+LLAMA_GW_LISTEN=:8090 \
+./llama-gateway
+```
+
+Environment variables:
+
+| Var | Default | Meaning |
+| --- | --- | --- |
+| `LLAMA_GW_UPSTREAM` | — (required) | llama.cpp base URL |
+| `LLAMA_GW_MODEL` | — (required) | model id served by the upstream |
+| `LLAMA_GW_LISTEN` | `:8090` | gateway listen address |
+| `LLAMA_GW_API_KEY` | unset | when set, clients must send this bearer token |
+
+### 3. Point a DSH provider route at the gateway
+
+Declare the route in DSH's models settings (or directly in the composition config) with the OpenAI-compatible completions protocol and the gateway as the endpoint:
+
+```yaml
+- name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+      llama-cpp:
+        displayName: llama.cpp (via go-llama-adapter)
+        api: openai-completions
+        baseURL: http://127.0.0.1:8090/v1
+        # apiKeyEnv: LLAMA_GW_API_KEY   # only if you set LLAMA_GW_API_KEY
+        models:
+          - id: qwen3
+            name: Qwen3
+            contextWindow: 32768
+```
+
+The gateway implements `GET /v1/models`, so DSH's model discovery for the route works as usual. Requests that select this provider then flow DSH → gateway → llama.cpp, and the adapter's tool-call id deduplication is applied transparently on the way through: if the model re-issues a call with the same id, DSH's session-log validator never sees duplicate advertised ids (the exact corruption documented in `PROGRESS.md`).
+
+### Why a gateway and not a DSH plugin
+
+- DSH's plugin seam is Node/TS; a Go binary can only participate over the network.
+- The gateway is useful on its own for any OpenAI-compatible client (other agents, scripts, OpenAI SDKs).
+- One source of truth for the server quirks (id dedup, `reasoning_content`, usage chunk ordering) instead of spreading them across every consumer.
+
 ## API overview
 
 | Type | Purpose |
@@ -109,4 +174,9 @@ Or consume the whole stream at once with `msg, err := stream.Wait()`.
 go test ./...
 ```
 
-The test suite runs against an in-process `httptest` mock of the llama.cpp endpoint, covering: plain text, tool call streaming, duplicate-id deduplication, reasoning blocks, interleaved text/tool/text, server-side errors, HTTP errors, missing `finish_reason`, and exact request wire format (verbatim argument replay, `reasoning_content`, image parts, compat fields).
+Both packages run against in-process `httptest` mocks of the llama.cpp endpoint (no real server needed):
+
+- `llama/` — the adapter: plain text, tool call streaming, duplicate-id deduplication, reasoning blocks, interleaved text/tool/text, server-side errors, HTTP errors, missing `finish_reason`, usage-after-finish ordering, and exact request wire format (verbatim argument replay, `reasoning_content`, image parts, compat fields).
+- `cmd/llama-gateway/` — the gateway end-to-end: streaming relay, the full duplicate-id dedup path from upstream SSE through to OpenAI SSE out, the blocking (non-streaming) path, and model discovery.
+
+Run the race detector with `go test -race ./...`.

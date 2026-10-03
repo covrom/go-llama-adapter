@@ -108,13 +108,31 @@ type wireChunk struct {
 
 type toolSlot struct {
 	blockIdx int
-	id       string
-	name     string
-	args     strings.Builder
+	// call is the live ToolCall shared with the content block and with
+	// toolcall_start/toolcall_end events; fields are filled in as deltas
+	// arrive.
+	call *ToolCall
+	args strings.Builder
+	// opened reports whether the toolcall block has been opened and the
+	// toolcall_start event emitted.
+	opened bool
 	// sawID/sawName let us detect a re-issued call that only carries the
 	// id (or only the name) in later deltas.
 	sawID   bool
 	sawName bool
+}
+
+// openToolSlot closes text/thinking blocks, opens the tool-call content
+// block, and emits toolcall_start carrying the (deduplicated) id and name
+// known so far.
+func (st *streamState) openToolSlot(slot *toolSlot, wireIdx int, send func(Event) bool) {
+	st.closeText(send)
+	st.closeThinking(send)
+	st.msg.Blocks = append(st.msg.Blocks, ContentBlock{Kind: "toolcall", ToolCall: slot.call})
+	slot.blockIdx = len(st.msg.Blocks) - 1
+	slot.opened = true
+	st.toolOrder = append(st.toolOrder, wireIdx)
+	send(Event{Type: EventToolCallStart, ContentIndex: slot.blockIdx, ToolCall: slot.call})
 }
 
 // readStream consumes the SSE body and produces the event stream.
@@ -155,6 +173,7 @@ func (c *Client) readStream(ctx context.Context, body io.ReadCloser) *Stream {
 		scanner := bufio.NewScanner(body)
 		scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 		fin := false
+		var wireReason string
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			if line == "" || strings.HasPrefix(line, ":") { // SSE comment/keep-alive
@@ -179,6 +198,20 @@ func (c *Client) readStream(ctx context.Context, body io.ReadCloser) *Stream {
 			if ch.Model != "" {
 				msg.Model = ch.Model
 			}
+			if fin {
+				// After finish_reason only trailing metadata is expected;
+				// collect usage and stop translating deltas so the done
+				// event is emitted after every write to msg.
+				if ch.Usage != nil {
+					msg.Usage = *ch.Usage
+				}
+				for _, choice := range ch.Choices {
+					if choice.Usage != nil {
+						msg.Usage = *choice.Usage
+					}
+				}
+				continue
+			}
 			if ch.Usage != nil {
 				msg.Usage = *ch.Usage
 			}
@@ -188,7 +221,7 @@ func (c *Client) readStream(ctx context.Context, body io.ReadCloser) *Stream {
 				}
 				st.applyDelta(choice.Delta, send)
 				if choice.FinishReason != nil {
-					st.finish(*choice.FinishReason, send)
+					wireReason = *choice.FinishReason
 					fin = true
 				}
 			}
@@ -205,10 +238,14 @@ func (c *Client) readStream(ctx context.Context, body io.ReadCloser) *Stream {
 			st.fail(ctx, ctx.Err(), send)
 			return
 		}
-		if !fin {
+		// Emit done only after every write to msg, so a consumer reading
+		// Partial at done sees the final usage (which arrives on the
+		// trailing chunk after finish_reason) without a race.
+		if fin {
+			st.finish(wireReason, send)
+		} else {
 			// Stream ended without finish_reason (older servers): infer.
 			st.finish(st.inferFinishReason(), send)
-			fin = true
 		}
 	}()
 	return s
@@ -303,26 +340,31 @@ func (st *streamState) applyDelta(d delta, send func(Event) bool) {
 	for _, tc := range d.ToolCalls {
 		slot, ok := st.toolSlots[tc.Index]
 		if !ok {
-			st.closeText(send)
-			st.closeThinking(send)
-			slot = &toolSlot{
-				blockIdx: st.emitBlockStart("toolcall", EventToolCallStart, send),
-			}
 			if st.toolSlots == nil {
 				st.toolSlots = make(map[int]*toolSlot)
 			}
+			slot = &toolSlot{call: &ToolCall{}}
 			st.toolSlots[tc.Index] = slot
-			st.toolOrder = append(st.toolOrder, tc.Index)
 		}
-		if tc.ID != "" && !slot.sawID {
-			slot.id = st.uniqueToolCallID(tc.ID)
+		// The id is known before the block is opened so that the
+		// deduplicated id can be carried on toolcall_start. If the id
+		// never arrives (some servers omit it), the block is opened on
+		// the first delta instead.
+		idNow := tc.ID != "" && !slot.sawID
+		if idNow {
+			slot.call.ID = st.uniqueToolCallID(tc.ID)
 			slot.sawID = true
 		}
-		if tc.Function.Name != "" && !slot.sawName {
-			slot.name = tc.Function.Name
+		nameNow := tc.Function.Name != "" && !slot.sawName
+		if nameNow {
+			slot.call.Name = tc.Function.Name
 			slot.sawName = true
 		}
-		if tc.Function.Arguments != "" {
+		argsNow := tc.Function.Arguments != ""
+		if !slot.opened && (idNow || nameNow || argsNow) {
+			st.openToolSlot(slot, tc.Index, send)
+		}
+		if argsNow && slot.opened {
 			slot.args.WriteString(tc.Function.Arguments)
 			send(Event{Type: EventToolCallDelta, ContentIndex: slot.blockIdx, Delta: tc.Function.Arguments})
 		}
@@ -332,31 +374,21 @@ func (st *streamState) applyDelta(d delta, send func(Event) bool) {
 func (st *streamState) finalizeToolCalls(send func(Event) bool) {
 	for _, wireIdx := range st.toolOrder {
 		slot := st.toolSlots[wireIdx]
+		// A slot that never received id, name, or arguments (degenerate
+		// server behavior) is still opened here so it is reported.
+		if !slot.opened {
+			st.openToolSlot(slot, wireIdx, send)
+		}
 		args := slot.args.String()
 		if args == "" {
 			args = "{}"
 		}
-		arguments := json.RawMessage(args)
-		if !json.Valid(arguments) {
-			// Keep the raw stream even if a server produced malformed
-			// JSON; consumers can still see what was emitted.
-		}
-		tc := &ToolCall{
-			ID:        slot.id,
-			Name:      slot.name,
-			ArgsJSON:  args,
-			Arguments: arguments,
-		}
-		block := &st.msg.Blocks[slot.blockIdx]
-		block.ToolCall = tc
-		block.Text = "" // args live in ToolCall, not Text
-		ev := Event{Type: EventToolCallEnd, ContentIndex: slot.blockIdx, Block: tcAsBlock(tc)}
-		send(ev)
+		slot.call.ArgsJSON = args
+		// Arguments holds the raw stream even when it is not valid JSON;
+		// consumers see exactly what the server emitted.
+		slot.call.Arguments = json.RawMessage(args)
+		send(Event{Type: EventToolCallEnd, ContentIndex: slot.blockIdx, ToolCall: slot.call})
 	}
-}
-
-func tcAsBlock(tc *ToolCall) *ContentBlock {
-	return &ContentBlock{Kind: "toolcall", ToolCall: tc}
 }
 
 // inferFinishReason is used when the stream ends without a finish_reason

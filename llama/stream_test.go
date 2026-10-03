@@ -132,6 +132,36 @@ func TestSimpleTextStream(t *testing.T) {
 	}
 }
 
+// TestUsageCompleteAtDone pins the invariant that the trailing usage chunk
+// (which arrives after finish_reason) is collected before done is emitted.
+// A consumer that reads Partial.Usage at the done event — which is what a
+// gateway does to write its own usage SSE chunk — must see the final
+// counts, not a zero value or a half-written one. This is the invariant the
+// race detector caught when done was emitted at finish_reason.
+func TestUsageCompleteAtDone(t *testing.T) {
+	lines := []string{
+		chunk(`"delta":{"role":"assistant","content":"hi"}`, ""),
+		chunk(`"delta":{},"finish_reason":"stop"`, ""),
+		chunk(`"delta":{}`, `,"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9}`),
+		"data: [DONE]",
+	}
+	srv := sseServer(t, lines, nil)
+	defer srv.Close()
+	c := newClient(t, srv.URL)
+
+	s, err := c.Complete(context.Background(), []Message{UserMessage("hi")}, Params{})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	for ev := range s.Ch {
+		if ev.Type == EventDone {
+			if ev.Partial.Usage.TotalTokens != 9 {
+				t.Fatalf("usage at done = %+v (want total 9)", ev.Partial.Usage)
+			}
+		}
+	}
+}
+
 func TestToolCallsStreaming(t *testing.T) {
 	lines := []string{
 		chunk(`"delta":{"role":"assistant"}`, ""),
