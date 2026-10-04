@@ -7,6 +7,15 @@ let it drift from git history; if a step is not in git, it is not done.
 
 ---
 
+## 2026-10-04 — Docker packaging
+
+- Added `Dockerfile` (multi-stage: `golang:1.27-alpine` builder → `scratch`
+  runtime with only the static `llama-gateway` binary plus `wget` for the
+  `HEALTHCHECK` on `/healthz`), `docker-compose.yml` (a
+  `ggml-org/llama.cpp:server` upstream on the compose network plus the
+  gateway exposing `:8090`), and `.dockerignore`.
+- Verified: image builds; container starts and `/healthz` returns `ok`.
+
 ## 2026-07-21 — Gateway added; DSH integration documented
 
 - Added `cmd/llama-gateway/`: a standalone OpenAI-compatible HTTP gateway

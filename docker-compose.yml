@@ -1,0 +1,46 @@
+# Runs the OpenAI-compatible gateway in front of a llama.cpp server.
+#
+#   llama.cpp  ←  llama-gateway  →  OpenAI-compatible clients (e.g. DSH)
+#
+# Point clients at the gateway (host port 8090 by default) with an
+# OpenAI-compatible route: base_url http://<host>:8090/v1,
+# api: openai-completions.
+
+services:
+  llamacpp:
+    image: ggml-org/llama.cpp:server
+    # Override MODEL_PATH for your own model file.
+    environment:
+      - MODEL_PATH=/models/model.gguf
+    volumes:
+      - ./models:/models:ro
+    # GPU: add e.g. --gpu-layers 99 --n-gpu-layers 99 to command below,
+    # and the matching nvidia runtime.
+    command:
+      [
+        "--ctx-size", "8192",
+        "--port", "8080",
+        "--host", "0.0.0.0",
+        "--model", "/models/model.gguf",
+        "--chat-format", "chatml",
+      ]
+    expose:
+      - "8080"
+    restart: unless-stopped
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      - llamacpp
+    environment:
+      - LLAMA_GW_UPSTREAM=http://llamacpp:8080
+      # Must match the model the llama.cpp server serves.
+      - LLAMA_GW_MODEL=model
+      # Set to require Bearer auth on /v1/chat/completions.
+      # - LLAMA_GW_API_KEY=${LLAMA_GW_API_KEY:-}
+      - LLAMA_GW_LISTEN=:8090
+    ports:
+      - "8090:8090"
+    restart: unless-stopped
