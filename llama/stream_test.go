@@ -201,6 +201,55 @@ func TestToolCallsStreaming(t *testing.T) {
 	}
 }
 
+// TestToolCallNameInLaterChunk pins a server that sends the tool-call id in
+// one delta and the name with the first argument fragment in the next:
+// toolcall_start must still carry the name, because a gateway emits the
+// id/name header on that event and later deltas carry only arguments.
+func TestToolCallNameInLaterChunk(t *testing.T) {
+	lines := []string{
+		chunk(`"delta":{"role":"assistant"}`, ""),
+		chunk(`"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function"}]}`, ""),
+		chunk(`"delta":{"tool_calls":[{"index":0,"function":{"name":"bash","arguments":"{\"cmd\":\"ls\"}"}}]}`, ""),
+		chunk(`"delta":{},"finish_reason":"tool_calls"`, ""),
+		"data: [DONE]",
+	}
+	srv := sseServer(t, lines, nil)
+	defer srv.Close()
+	c := newClient(t, srv.URL)
+
+	msg, events, err := run(t, c, []Message{UserMessage("list")}, Params{})
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	calls := msg.ToolCalls()
+	if len(calls) != 1 {
+		t.Fatalf("tool calls = %d", len(calls))
+	}
+	if calls[0].ID != "call_1" || calls[0].Name != "bash" {
+		t.Fatalf("call = %+v", calls[0])
+	}
+	if calls[0].ArgsJSON != `{"cmd":"ls"}` {
+		t.Fatalf("args = %q", calls[0].ArgsJSON)
+	}
+	startIdx, deltaIdx := -1, -1
+	for i, ev := range events {
+		switch ev.Type {
+		case EventToolCallStart:
+			if ev.ToolCall == nil || ev.ToolCall.ID != "call_1" || ev.ToolCall.Name != "bash" {
+				t.Fatalf("toolcall_start carries %+v", ev.ToolCall)
+			}
+			startIdx = i
+		case EventToolCallDelta:
+			if deltaIdx < 0 {
+				deltaIdx = i
+			}
+		}
+	}
+	if startIdx < 0 || deltaIdx < 0 || startIdx > deltaIdx {
+		t.Fatalf("start=%d delta=%d events=%+v", startIdx, deltaIdx, events)
+	}
+}
+
 // TestDuplicateToolCallIDs reproduces the provider behavior that corrupted
 // DSH sessions: the server re-issues the same function call (same id) with
 // modified arguments. The adapter must keep ids unique with #2, #3 suffixes

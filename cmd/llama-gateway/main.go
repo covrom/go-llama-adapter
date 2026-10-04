@@ -25,6 +25,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -82,10 +83,15 @@ func main() {
 			writeError(w, http.StatusBadRequest, "messages is required")
 			return
 		}
+		params, err := decodeParams(req)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		if req.Stream {
-			handleStream(w, r, client, model, msgs, req)
+			handleStream(w, r, client, model, msgs, params)
 		} else {
-			handleBlocking(w, r, client, model, msgs, req)
+			handleBlocking(w, r, client, model, msgs, params)
 		}
 	})
 	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, r *http.Request) {
@@ -123,8 +129,12 @@ type chatReq struct {
 	Stream              bool      `json:"stream"`
 	Tools               []anyTool `json:"tools"`
 	Temperature         *float64  `json:"temperature"`
+	TopP                *float64  `json:"top_p"`
 	MaxCompletionTokens *int      `json:"max_completion_tokens"`
 	MaxTokens           *int      `json:"max_tokens"`
+	// Stop is either a string or an array of strings per the OpenAI spec;
+	// the concrete type is validated by decodeStop.
+	Stop any `json:"stop"`
 }
 
 type anyMsg struct {
@@ -133,6 +143,9 @@ type anyMsg struct {
 	Name       string  `json:"name"`
 	ToolCalls  []anyTC `json:"tool_calls"`
 	ToolCallID string  `json:"tool_call_id"`
+	// ReasoningContent is the DeepSeek/llama.cpp extension used to replay
+	// assistant reasoning for reasoning models.
+	ReasoningContent string `json:"reasoning_content"`
 }
 
 type anyTool struct {
@@ -156,7 +169,7 @@ type anyTC struct {
 func decodeMessages(in []anyMsg) ([]llama.Message, error) {
 	out := make([]llama.Message, 0, len(in))
 	for i, m := range in {
-		lm := llama.Message{Role: llama.Role(m.Role), Name: m.Name, ToolCallID: m.ToolCallID}
+		lm := llama.Message{Role: llama.Role(m.Role), Name: m.Name, ToolCallID: m.ToolCallID, Thinking: m.ReasoningContent}
 		switch c := m.Content.(type) {
 		case nil:
 		case string:
@@ -204,9 +217,15 @@ func decodeTools(in []anyTool) []llama.Tool {
 	return out
 }
 
-func decodeParams(req chatReq) llama.Params {
+func decodeParams(req chatReq) (llama.Params, error) {
+	stop, err := decodeStop(req.Stop)
+	if err != nil {
+		return llama.Params{}, err
+	}
 	p := llama.Params{
 		Temperature: req.Temperature,
+		TopP:        req.TopP,
+		Stop:        stop,
 		Tools:       decodeTools(req.Tools),
 	}
 	if req.MaxCompletionTokens != nil {
@@ -214,7 +233,36 @@ func decodeParams(req chatReq) llama.Params {
 	} else if req.MaxTokens != nil {
 		p.MaxCompletionTokens = req.MaxTokens
 	}
-	return p
+	return p, nil
+}
+
+// decodeStop accepts the three shapes OpenAI allows for `stop`: a single
+// string, an array of strings, or null/absent.
+func decodeStop(v any) ([]string, error) {
+	switch s := v.(type) {
+	case nil:
+		return nil, nil
+	case string:
+		if s == "" {
+			return nil, nil
+		}
+		return []string{s}, nil
+	case []any:
+		out := make([]string, 0, len(s))
+		for _, e := range s {
+			str, ok := e.(string)
+			if !ok {
+				return nil, errors.New("stop must be a string or an array of strings")
+			}
+			out = append(out, str)
+		}
+		if len(out) == 0 {
+			return nil, nil
+		}
+		return out, nil
+	default:
+		return nil, errors.New("stop must be a string or an array of strings")
+	}
 }
 
 func chatID() string {
@@ -243,6 +291,8 @@ type sseChoice struct {
 
 type sseChunk struct {
 	ID      string       `json:"id"`
+	Object  string       `json:"object"`
+	Created int64        `json:"created"`
 	Model   string       `json:"model"`
 	Choices []sseChoice  `json:"choices"`
 	Usage   *llama.Usage `json:"usage,omitempty"`
@@ -251,15 +301,19 @@ type sseChunk struct {
 // handleStream relays the adapter event stream as OpenAI SSE.
 //
 // Mapping rules:
+//   - every chunk carries the OpenAI envelope (object "chat.completion.chunk",
+//     created, id, model) because SDK streaming helpers filter on the object
+//     value and accumulate created;
 //   - the assistant role is emitted once, on the first content delta;
 //   - text and reasoning deltas map to content / reasoning_content;
 //   - toolcall_start carries the (deduplicated) id and name on the
 //     first tool_call delta of the slot, argument fragments follow on
 //     later deltas of the same slot index;
-//   - done emits a finish_reason chunk followed by a usage chunk and
-//     [DONE]; error emits one error chunk and terminates the stream.
-func handleStream(w http.ResponseWriter, r *http.Request, c *llama.Client, model string, msgs []llama.Message, req chatReq) {
-	stream, err := c.Complete(r.Context(), msgs, decodeParams(req))
+//   - done emits a finish_reason chunk followed by a usage chunk with an
+//     empty choices array and [DONE]; error emits one error chunk and
+//     terminates the stream.
+func handleStream(w http.ResponseWriter, r *http.Request, c *llama.Client, model string, msgs []llama.Message, p llama.Params) {
+	stream, err := c.Complete(r.Context(), msgs, p)
 	if err != nil {
 		if he, ok := err.(*llama.HTTPError); ok {
 			writeError(w, he.Status, he.Body)
@@ -273,11 +327,21 @@ func handleStream(w http.ResponseWriter, r *http.Request, c *llama.Client, model
 	w.WriteHeader(http.StatusOK)
 	fl, _ := w.(http.Flusher)
 	id := chatID()
+	created := time.Now().Unix()
 	emit := func(v any) {
 		b, _ := json.Marshal(v)
 		fmt.Fprintf(w, "data: %s\n\n", b)
 		if fl != nil {
 			fl.Flush()
+		}
+	}
+	chunk := func(choices []sseChoice) sseChunk {
+		return sseChunk{
+			ID:      id,
+			Object:  "chat.completion.chunk",
+			Created: created,
+			Model:   model,
+			Choices: choices,
 		}
 	}
 
@@ -293,49 +357,53 @@ func handleStream(w http.ResponseWriter, r *http.Request, c *llama.Client, model
 	for ev := range stream.Ch {
 		switch ev.Type {
 		case llama.EventTextDelta:
-			emit(sseChunk{ID: id, Model: model, Choices: []sseChoice{{
+			emit(chunk([]sseChoice{{
 				Index: 0,
 				Delta: wireDelta{Role: roleFor(), Content: ev.Delta},
-			}}})
+			}}))
 		case llama.EventThinkingDelta:
 			// Consumers that do not know reasoning_content ignore it;
 			// llama.cpp-aware clients use it for thinking replay.
-			emit(sseChunk{ID: id, Model: model, Choices: []sseChoice{{
+			emit(chunk([]sseChoice{{
 				Index: 0,
 				Delta: wireDelta{Role: roleFor(), ReasoningContent: ev.Delta},
-			}}})
+			}}))
 		case llama.EventToolCallStart:
 			tc := map[string]any{"index": ev.ContentIndex}
 			if ev.ToolCall != nil {
 				if ev.ToolCall.ID != "" {
 					tc["id"] = ev.ToolCall.ID
-					tc["type"] = "function"
 				}
 				if ev.ToolCall.Name != "" {
 					tc["function"] = map[string]any{"name": ev.ToolCall.Name}
 				}
+				// The OpenAI wire marks the call type on the first delta of
+				// the slot; SDKs reject a tool call whose type is missing.
+				if ev.ToolCall.ID != "" || ev.ToolCall.Name != "" {
+					tc["type"] = "function"
+				}
 			}
 			if len(tc) > 1 {
-				emit(sseChunk{ID: id, Model: model, Choices: []sseChoice{{
+				emit(chunk([]sseChoice{{
 					Index: 0,
 					Delta: wireDelta{Role: roleFor(), ToolCalls: []map[string]any{tc}},
-				}}})
+				}}))
 			}
 		case llama.EventToolCallDelta:
-			emit(sseChunk{ID: id, Model: model, Choices: []sseChoice{{
+			emit(chunk([]sseChoice{{
 				Index: 0,
 				Delta: wireDelta{Role: roleFor(), ToolCalls: []map[string]any{{
 					"index":    ev.ContentIndex,
 					"function": map[string]any{"arguments": ev.Delta},
 				}}},
-			}}})
+			}}))
 		case llama.EventDone:
 			if !roleSent {
 				// The stream carried no content (e.g. empty completion).
-				emit(sseChunk{ID: id, Model: model, Choices: []sseChoice{{
+				emit(chunk([]sseChoice{{
 					Index: 0,
 					Delta: wireDelta{Role: "assistant"},
-				}}})
+				}}))
 			}
 			fr := map[llama.StopReason]string{
 				llama.StopStop:          "stop",
@@ -346,14 +414,18 @@ func handleStream(w http.ResponseWriter, r *http.Request, c *llama.Client, model
 			if fr == "" {
 				fr = "stop"
 			}
-			emit(sseChunk{ID: id, Model: model, Choices: []sseChoice{{
+			emit(chunk([]sseChoice{{
 				Index:        0,
 				Delta:        wireDelta{},
 				FinishReason: &fr,
-			}}})
+			}}))
 			if ev.Partial != nil && ev.Partial.Usage.TotalTokens != 0 {
 				u := ev.Partial.Usage
-				emit(sseChunk{ID: id, Model: model, Usage: &u})
+				// OpenAI sends the usage-only chunk with an empty (never
+				// absent or null) choices array.
+				usageChunk := chunk([]sseChoice{})
+				usageChunk.Usage = &u
+				emit(usageChunk)
 			}
 			fmt.Fprint(w, "data: [DONE]\n\n")
 			if fl != nil {
@@ -379,8 +451,8 @@ func errText(err error) string {
 
 // --- blocking (non-streaming) path ---
 
-func handleBlocking(w http.ResponseWriter, r *http.Request, c *llama.Client, model string, msgs []llama.Message, req chatReq) {
-	stream, err := c.Complete(r.Context(), msgs, decodeParams(req))
+func handleBlocking(w http.ResponseWriter, r *http.Request, c *llama.Client, model string, msgs []llama.Message, p llama.Params) {
+	stream, err := c.Complete(r.Context(), msgs, p)
 	if err != nil {
 		if he, ok := err.(*llama.HTTPError); ok {
 			writeError(w, he.Status, he.Body)
@@ -397,10 +469,20 @@ func handleBlocking(w http.ResponseWriter, r *http.Request, c *llama.Client, mod
 	message := map[string]any{"role": "assistant", "content": msg.Text()}
 	fr := "stop"
 	switch msg.Stop {
-	case llama.StopToolUse:
-		fr = "tool_calls"
-		tcOut := []map[string]any{}
-		for _, tc := range msg.ToolCalls() {
+	case llama.StopLength:
+		fr = "length"
+	case llama.StopContentFilter:
+		fr = "content_filter"
+	}
+	// Tool calls are reported whenever the message contains any, not only
+	// when the server said finish_reason=tool_calls: a server that streams
+	// calls and then stops with "stop" must not have them silently dropped.
+	if calls := msg.ToolCalls(); len(calls) > 0 {
+		if fr == "stop" {
+			fr = "tool_calls"
+		}
+		tcOut := make([]map[string]any, 0, len(calls))
+		for _, tc := range calls {
 			tcOut = append(tcOut, map[string]any{
 				"id":   tc.ID,
 				"type": "function",
@@ -411,10 +493,6 @@ func handleBlocking(w http.ResponseWriter, r *http.Request, c *llama.Client, mod
 			})
 		}
 		message["tool_calls"] = tcOut
-	case llama.StopLength:
-		fr = "length"
-	case llama.StopContentFilter:
-		fr = "content_filter"
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
@@ -432,12 +510,21 @@ func handleBlocking(w http.ResponseWriter, r *http.Request, c *llama.Client, mod
 }
 
 func writeError(w http.ResponseWriter, status int, msg string) {
+	// OpenAI reports client mistakes as invalid_request_error and upstream
+	// failures as server_error; keep the distinction so SDK-side retry and
+	// classification logic sees the right kind.
+	errType := "invalid_request_error"
+	if status >= http.StatusInternalServerError {
+		errType = "server_error"
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(map[string]any{
 		"error": map[string]any{
 			"message": strings.TrimSpace(msg),
-			"type":    "invalid_request_error",
+			"type":    errType,
+			"param":   nil,
+			"code":    nil,
 		},
 	})
 }

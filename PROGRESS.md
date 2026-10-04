@@ -7,6 +7,45 @@ let it drift from git history; if a step is not in git, it is not done.
 
 ---
 
+## 2026-10-04 — OpenAI protocol conformance fixes
+
+Audited the gateway against the OpenAI chat-completions wire format by
+replaying crafted llama.cpp SSE fixtures through it, and fixed what the
+probes reproduced:
+
+- Stream chunks now carry the full envelope (`object:
+  "chat.completion.chunk"`, `created`, `id`, `model`). openai-python's
+  `.stream()` helper filters every chunk on `object` and silently discarded
+  the whole stream without it.
+- The usage-only chunk sends `"choices": []` (was `null`), which clients that
+  iterate choices cannot parse.
+- A tool-call name arriving in a later chunk than its id now reaches the
+  client: the library opens the tool slot on the first delta that carries a
+  name or arguments, not on the id alone. The deduplicated id is still
+  assigned on first sight and carried on `toolcall_start`, so invariant 2
+  holds and argument deltas still follow the start event.
+- The blocking path reports tool calls whenever the message contains any, not
+  only when the server sent `finish_reason: "tool_calls"`.
+- `type: "function"` is emitted on the first tool-call delta even when the
+  server omits the id.
+- `top_p` and `stop` are forwarded to llama.cpp (previously dropped
+  silently); `stop` accepts the string/array/null forms, a bad type is a 400.
+- Assistant `reasoning_content` from the client is replayed (kept in
+  `Message.Thinking`).
+- 5xx responses are typed `server_error`, not `invalid_request_error`, and
+  the error object carries `param`/`code`.
+
+Tests: `TestToolCallNameInLaterChunk` (library),
+`TestGatewayStreamChunkEnvelope`, `TestGatewayStreamToolCallNameAfterID`,
+`TestGatewayBlockingToolCallsWithStopFinish`, `TestGatewayRequestParams`,
+`TestGatewayStopFormsAndValidation`, `TestGatewayErrorType` (gateway).
+`gofmt -l .`, `go build ./...`, `go vet ./...`,
+`go test -race -count=1 ./...` all clean.
+
+Known gaps, not addressed: `n > 1`, `tool_choice`, `response_format`, `seed`,
+penalties and `logprobs` are still ignored silently; there is no
+`GET /v1/models/{id}`.
+
 ## 2026-10-04 — Docker packaging
 
 - Added `Dockerfile` (multi-stage: `golang:1.27-alpine` builder → `scratch`

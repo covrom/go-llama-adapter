@@ -56,7 +56,11 @@ test; if you touch the affected code, the test must keep passing.
    `TestGatewayStreamDuplicateToolCallIDs` (gateway).
 2. **The deduplicated id is known at `toolcall_start`**, not only at
    `toolcall_end` — the gateway relies on this to emit id/name in the first
-   tool_call delta of an OpenAI stream.
+   tool_call delta of an OpenAI stream. The slot opens on the first delta
+   that carries a name or arguments (not on the id alone), so a name that
+   arrives after the id is still delivered on the start event.
+   Test: `TestToolCallNameInLaterChunk` (library),
+   `TestGatewayStreamToolCallNameAfterID` (gateway).
 3. **`done` is emitted only after all writes to `AssistantMessage` are
    complete** — including trailing `usage` that arrives after
    `finish_reason`. A consumer reading `Partial` at `done` sees the final

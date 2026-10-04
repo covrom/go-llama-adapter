@@ -361,7 +361,15 @@ func (st *streamState) applyDelta(d delta, send func(Event) bool) {
 			slot.sawName = true
 		}
 		argsNow := tc.Function.Arguments != ""
-		if !slot.opened && (idNow || nameNow || argsNow) {
+		// Open on the first delta that carries a name or arguments, not on
+		// the id alone: some servers send the id in one chunk and the name
+		// together with the first argument fragment in the next. Opening on
+		// the id would emit toolcall_start without the name, and the name
+		// would never reach the consumer (later deltas only carry
+		// arguments). The deduplicated id is assigned above, so it is still
+		// carried on toolcall_start; a slot that only ever gets an id is
+		// opened by finalizeToolCalls.
+		if !slot.opened && (nameNow || argsNow) {
 			st.openToolSlot(slot, tc.Index, send)
 		}
 		if argsNow && slot.opened {
